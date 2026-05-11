@@ -1,0 +1,15 @@
+{
+  "name": "vitals7-realtime-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Central SSE hub: device connectors publish; Vitals7 SPA subscribes via proxied /realtime/events/:cognitoSub",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
