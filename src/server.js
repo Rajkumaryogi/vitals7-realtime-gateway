@@ -4,13 +4,21 @@
  * - Browsers: GET /events/:cognitoSub (EventSource), typically via Vite proxy /realtime → this service.
  * - Connectors: POST /internal/publish { userId, type?, source?, data? } + header X-Gateway-Secret
  *
- * Env: PORT (default 8095), VITALS_REALTIME_GATEWAY_SECRET (default vitals7-local-dev-realtime)
+ * Env: PORT, VITALS_REALTIME_GATEWAY_SECRET, REALTIME_SSE_PING_MS, REALTIME_TCP_NODELAY
  */
 import express from 'express'
 import http from 'http'
 
 const PORT = Number(process.env.PORT || 8095)
 const SECRET = process.env.VITALS_REALTIME_GATEWAY_SECRET || 'vitals7-local-dev-realtime'
+
+/** SSE comment ping (ms). 0 = disabled. Shorter = livelier through some proxies; avoid > Node keepAlive gap. */
+const rawPing = (process.env.REALTIME_SSE_PING_MS ?? '12000').trim()
+let SSE_PING_MS = Number.parseInt(rawPing, 10)
+if (!Number.isFinite(SSE_PING_MS) || SSE_PING_MS < 0) SSE_PING_MS = 12000
+
+/** Disable with REALTIME_TCP_NODELAY=0 if you need to coalesce tiny writes (not typical for this service). */
+const TCP_NODELAY = !/^0|false|no$/i.test(String(process.env.REALTIME_TCP_NODELAY ?? '1').trim())
 
 /** @type {Map<string, Set<import('http').ServerResponse>>} */
 const userClients = new Map()
@@ -25,7 +33,9 @@ function allowOrigin(origin) {
 }
 
 const app = express()
-app.use(express.json({ limit: '256kb' }))
+app.disable('x-powered-by')
+app.disable('etag')
+app.use(express.json({ limit: '64kb' }))
 
 app.get('/health', (_, res) => {
     res.json({ ok: true, service: 'vitals7-realtime-gateway', clients: userClients.size })
@@ -47,21 +57,28 @@ app.get('/events/:userId', (req, res) => {
     }
 
     res.writeHead(200, headers)
+    if (TCP_NODELAY) {
+        const sock = req.socket
+        if (sock && typeof sock.setNoDelay === 'function') sock.setNoDelay(true)
+    }
     res.write(`data: ${JSON.stringify({ type: 'connected', ts: new Date().toISOString() })}\n\n`)
 
     if (!userClients.has(userId)) userClients.set(userId, new Set())
     userClients.get(userId).add(res)
 
-    const ping = setInterval(() => {
-        try {
-            res.write(': ping\n\n')
-        } catch {
-            /* closed */
-        }
-    }, 25000)
+    let ping = null
+    if (SSE_PING_MS > 0) {
+        ping = setInterval(() => {
+            try {
+                res.write(': ping\n\n')
+            } catch {
+                /* closed */
+            }
+        }, SSE_PING_MS)
+    }
 
     req.on('close', () => {
-        clearInterval(ping)
+        if (ping) clearInterval(ping)
         const set = userClients.get(userId)
         if (set) {
             set.delete(res)
@@ -98,6 +115,21 @@ app.post('/internal/publish', (req, res) => {
     res.json({ ok: true, delivered })
 })
 
-http.createServer(app).listen(PORT, () => {
-    console.log(`vitals7-realtime-gateway http://localhost:${PORT} (secret: ${SECRET === 'vitals7-local-dev-realtime' ? 'default dev' : 'custom'})`)
+const server = http.createServer(app)
+
+if (TCP_NODELAY) {
+    server.on('connection', (socket) => {
+        socket.setNoDelay(true)
+    })
+}
+
+/** Long-lived SSE: avoid default 5s keep-alive closing streams between infrequent pings. */
+const keepMs = SSE_PING_MS > 0 ? Math.max(120_000, SSE_PING_MS * 6) : 120_000
+server.keepAliveTimeout = keepMs
+server.headersTimeout = Math.max(keepMs, 125_000)
+
+server.listen(PORT, () => {
+    console.log(
+        `vitals7-realtime-gateway http://localhost:${PORT} (secret: ${SECRET === 'vitals7-local-dev-realtime' ? 'default dev' : 'custom'}, tcpNoDelay: ${TCP_NODELAY}, ssePingMs: ${SSE_PING_MS})`
+    )
 })
